@@ -77,6 +77,19 @@ class NonNegScale(nn.Module):
     def forward(self, x):
         return x * self.scale
 
+class NonNegScale3(nn.Module):
+    def __init__(self, d) -> None:
+        super().__init__()
+        self._scale = torch.nn.Parameter(torch.zeros(1, d, 1))
+        self.elu = nn.ELU()
+
+    @property
+    def scale(self):
+        return self.elu(self._scale) + 1
+
+    def forward(self, x):
+        return x * self.scale
+
 
 class BilinearAttention(nn.Module):
     def __init__(self, d_in: int, n_heads: int, n_scales: int = 2, d_out: int = None):
@@ -87,7 +100,7 @@ class BilinearAttention(nn.Module):
         :param n_scales: number of scales (default 2, i.e., ego and local; 3 will add global)
         :param d_out: _description_, defaults to None (meaning d_out = d_in)
         """
-        super(BilinearAttention, self).__init__()
+        super().__init__()
         if d_out is None:
             d_out = d_in
         self.d_in = d_in
@@ -110,9 +123,13 @@ class BilinearAttention(nn.Module):
             
         self.w_ego = NonNegScale(n_heads)
 
+        # add these two:
+        self.w_local = NonNegScale3(n_heads)
+        self.w_global = NonNegScale3(n_heads)
+
         self.tanh = nn.Tanh() # for clamping of the values
 
-        self.v = NonNegLinear(n_heads, d_out, bias=False) # each column ..
+        self.v = NonNegLinear(n_heads, d_out, bias=False) # each column ...
         # self.v = TransposedNonNegLinear(self.q)
 
         # remember some variables during forward
@@ -204,9 +221,15 @@ class BilinearAttention(nn.Module):
         # Get raw attention scores
         # scale_switch = self.switch() # h * s
         ego_score = self.w_ego(self.score_intrinsic(q_emb, q_emb)) # * scale_switch[:, 0].reshape([1, self.n_heads])
-        local_score = (self.score_interactive(q_emb, k_local_emb, adj_list)) #  * scale_switch[:, 1].reshape([1, self.n_heads, 1]) # n * h * m
-        regional_scores = [(self.score_interactive(q_emb, k_regional_emb, regional_adj_list))
-                           for i, (k_regional_emb, regional_adj_list) in enumerate(zip(k_regional_embs, regional_adj_lists))]
+        #local_score = (self.score_interactive(q_emb, k_local_emb, adj_list)) #  * scale_switch[:, 1].reshape([1, self.n_heads, 1]) # n * h * m
+        local_score = self.w_local((self.score_interactive(q_emb, k_local_emb,
+                                              adj_list)))  # * scale_switch[:, 1].reshape([1, self.n_heads, 1]) # n * h * m
+
+        #regional_scores = [(self.score_interactive(q_emb, k_regional_emb, regional_adj_list))
+        #                   for i, (k_regional_emb, regional_adj_list) in enumerate(zip(k_regional_embs, regional_adj_lists))]
+        regional_scores = [(self.w_global(self.score_interactive(q_emb, k_regional_emb, regional_adj_list)))
+                           for i, (k_regional_emb, regional_adj_list) in
+                           enumerate(zip(k_regional_embs, regional_adj_lists))]
         # regional_scores = [self.score_interactive(q_emb, k_regional_emb, adj_list) * scale_switch[:, i + 2].reshape([1, self.n_heads, 1]) for i, k_regional_emb in enumerate(k_regional_embs)]
 
         # Normalize attention scores
@@ -253,7 +276,7 @@ class Steamboat(nn.Module):
         :param n_heads: number of heads
         :param n_scales: number of scales (default 2, i.e., ego and local; 3 will add global)
         """
-        super(Steamboat, self).__init__()
+        super().__init__()
 
         if isinstance(features, list):
             self.features = features
