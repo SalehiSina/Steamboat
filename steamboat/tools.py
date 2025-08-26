@@ -31,20 +31,28 @@ def rank(x, axis=1):
     return np.argsort(np.argsort(x, axis=axis), axis=axis)
 
 
-def calc_v_weights(model: Steamboat, normalize: bool = True):
+def calc_v_weights(device, model, normalize: bool = True):
     """Calculate weight of reconstruction (w_v) metagene
 
     :param model: Steamboat model
     :param normalize: whether normalize the sum to 1, defaults to True
     :return: weights
     """
-    v_weights = model.spatial_gather.v.weight.detach().cpu().numpy().sum(axis=0)
-    if normalize:
-        v_weights = v_weights / sum(v_weights)
-    return v_weights
+    if device == 'cpu':
+        v_weights = model.spatial_gather.v.weight.detach().numpy().sum(axis=0)
+        if normalize:
+            v_weights = v_weights / sum(v_weights)
+        return v_weights
+
+    else:
+
+        v_weights = model.spatial_gather.v.weight.detach().cpu().numpy().sum(axis=0)
+        if normalize:
+            v_weights = v_weights / sum(v_weights)
+        return v_weights
 
 
-def calc_head_weights(adatas, model: Steamboat):
+def calc_head_weights(device, adatas, model):
     """Calculate weights of heads and scales within each head
 
     :param adatas: all adatas
@@ -60,7 +68,7 @@ def calc_head_weights(adatas, model: Steamboat):
         local += np.mean(adatas[i].obsm['local_attn'], axis=0)
         regional += np.mean(adatas[i].obsm['global_attn_0'], axis=0)
 
-    matrix = np.vstack([ego, local, regional]) * calc_v_weights(model)
+    matrix = np.vstack([ego, local, regional]) * calc_v_weights(device, model)
 
     return matrix
 
@@ -247,34 +255,51 @@ def plot_geneset_auroc(sig_df, order, figsize=(8, 5)):
     fig.tight_layout()
     return fig, ax
 
-def calc_obs(adatas: list[sc.AnnData], dataset: SteamboatDataset, model: Steamboat, 
-                    device='cuda', get_recon: bool = False):
-    """Calculate and store the embeddings and attention scores in the AnnData objects
-    
-    :param adatas: List of AnnData objects to store the embeddings and attention scores
-    :param dataset: SteamboatDataset object to be processed
-    :param model: Steamboat model
-    :param device: Device to run the model, defaults to 'cuda'
-    :param get_recon: Whether to store the reconstructed data, defaults to False
-    """
-    # Safeguards
-    assert len(adatas) == len(dataset), "mismatch in lenghths of adatas and dataset"
-    for adata, data in zip(adatas, dataset):
-        assert adata.shape[0] == data[0].shape[0], f"adata[{i}] has {adata.shape[0]} cells but dataset[{i}] has {data[0].shape[0]}."
 
-    # Calculate embeddings and attention scores for each slide
+def calc_obs(adatas: list[sc.AnnData], dataset: 'SteamboatDataset', model: 'Steamboat',
+             device=None, get_recon: bool = False):
+    """
+    Calculate and store the embeddings and attention scores in the AnnData objects.
+
+    :param adatas: List of AnnData objects to store embeddings/attention
+    :param dataset: SteamboatDataset object to process
+    :param model: Steamboat model
+    :param device: Device to run the model ('cpu' or 'cuda'); defaults to CPU if not specified
+    :param get_recon: Whether to store reconstructed data
+    """
+    import torch
+    from tqdm import tqdm
+    import scipy as sp
+
+    # Automatically select CPU if device not provided
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = torch.device(device)
+
+    # Safeguard: ensure lengths match
+    assert len(adatas) == len(dataset), "Mismatch in lengths of adatas and dataset"
+
+    for idx, (adata, data) in enumerate(zip(adatas, dataset)):
+        assert adata.shape[0] == data[0].shape[0], \
+            f"adata[{idx}] has {adata.shape[0]} cells but dataset[{idx}] has {data[0].shape[0]}."
+
+    # Loop over all slides
     for i, (x, adj_list, regional_xs, regional_adj_lists) in tqdm(enumerate(dataset), total=len(dataset)):
+        # Move tensors to the selected device
         adj_list = adj_list.squeeze(0).to(device)
         x = x.squeeze(0).to(device)
         regional_adj_lists = [regional_adj_list.to(device) for regional_adj_list in regional_adj_lists]
         regional_xs = [regional_x.to(device) for regional_x in regional_xs]
-        
+
         with torch.no_grad():
             res, details = model(adj_list, x, x, regional_adj_lists, regional_xs, get_details=True)
-            
+
+            # Store reconstructed data if requested
             if get_recon:
                 adatas[i].obsm['X_recon'] = res.cpu().numpy()
 
+            # Store embeddings
             adatas[i].obsm['q'] = details['embq'].cpu().numpy()
             adatas[i].obsm['local_k'] = details['embk'][0].cpu().numpy()
 
@@ -283,7 +308,7 @@ def calc_obs(adatas: list[sc.AnnData], dataset: SteamboatDataset, model: Steambo
 
             for j, emb in enumerate(details['embk'][1]):
                 adatas[i].uns[f'global_k_{j}'] = emb.cpu().numpy()
-                
+
             adatas[i].obsm['attn'] = details['attn'].cpu().numpy()
             adatas[i].obsm['ego_attn'] = details['attnm'][0].cpu().numpy()
             adatas[i].obsm['local_attn'] = details['attnm'][1].cpu().numpy()
@@ -291,18 +316,18 @@ def calc_obs(adatas: list[sc.AnnData], dataset: SteamboatDataset, model: Steambo
             for j, matrix in enumerate(details['attnm'][2]):
                 adatas[i].obsm[f'global_attn_{j}'] = matrix.cpu().numpy()
 
-            # local attention (as graph)
+            # Local attention (as graph)
             for j in range(model.spatial_gather.n_heads):
                 w = details['attnp'][1].cpu().numpy()[:, j, :].flatten()
                 uv = adj_list.cpu().numpy()
                 u = uv[0]
                 v = uv[1]
-                if uv.shape[0] == 3: # masked for unequal neighbors
+                if uv.shape[0] == 3:  # masked for unequal neighbors
                     m = (uv[2] > 0)
                     w, u, v = w[m], u[m], v[m]
-                adatas[i].obsp[f'local_attn_{j}'] = sp.sparse.csr_matrix((w, (u, v)), 
-                                                                            shape=(adatas[i].shape[0], 
-                                                                                adatas[i].shape[0]))
+                adatas[i].obsp[f'local_attn_{j}'] = sp.sparse.csr_matrix(
+                    (w, (u, v)), shape=(adatas[i].shape[0], adatas[i].shape[0])
+                )
 
 
 def gather_obs(adata: sc.AnnData, adatas: list[sc.AnnData]):
